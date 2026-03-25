@@ -1,0 +1,13 @@
+*.backup
+*.zip
+01_*.py
+02_*.py
+03_*.py
+04_*.py
+05_*.py
+install_openai_scoring.sh
+setup.sh
+job_agent/job_agent/
+job_agent/CLEANED.md
+job_agent/debug_scoring.py
+job_agent/scoring/engine_debug.py
