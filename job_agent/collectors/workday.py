@@ -11,6 +11,7 @@ This returns the full JSON job description without needing a browser.
 """
 
 import logging
+import re
 import time
 from typing import Generator, List, Tuple
 
@@ -58,7 +59,7 @@ SEARCH_KEYWORDS = [
 
 class WorkdayCollector(BaseCollector):
     source_name = "workday"
-    rate_limit_seconds = 0.5  # Reduced — API calls are faster than HTML scraping
+    rate_limit_seconds = 0.5
 
     def __init__(
         self,
@@ -181,21 +182,29 @@ class WorkdayCollector(BaseCollector):
         try:
             title         = posting.get("title", "")
             external_path = posting.get("externalPath", "")
-            # Build apply URL safely
+
+            # Build human-facing apply URL
+            # API path:   /wday/cxs/{tenant}/{site}/job/Location/Title_ID
+            # Human URL:  /en-US/{site}/job/Location/Title_ID
             if external_path:
-                # Ensure path starts with /
                 if not external_path.startswith("/"):
                     external_path = "/" + external_path
-                apply_url = f"{base_url}{external_path}"
-                # Reject invalid Workday redirect URLs
+                human_path = re.sub(
+                    r"^/wday/cxs/[^/]+/([^/]+)",
+                    r"/en-US/\1",
+                    external_path
+                )
+                apply_url = f"{base_url}{human_path}"
+                # Reject invalid redirect URLs
                 if "community.workday" in apply_url or "invalid-url" in apply_url:
                     logger.debug(f"[workday] Invalid apply URL rejected: {apply_url}")
-                    apply_url = f"{base_url}/en-US/{site}/job"  # fallback to job board
+                    apply_url = f"{base_url}/en-US/{site}/job"
             else:
                 apply_url = ""
-            location      = self._normalize_location(posting.get("locationsText", "Unknown"))
 
-            # Use Workday detail API — NOT the HTML page (which is JS-rendered)
+            location = self._normalize_location(posting.get("locationsText", "Unknown"))
+
+            # Fetch full description via Workday detail API
             description, requirements = self._fetch_detail_api(
                 api_url, external_path, display_name, title
             )
@@ -232,23 +241,15 @@ class WorkdayCollector(BaseCollector):
     ) -> tuple:
         """
         Fetch full job description using Workday's detail API endpoint.
-
-        The detail API is:
-          POST {api_url}/{jobPostingId}
-        
-        This returns structured JSON including the full description — unlike
-        the HTML page which requires JavaScript to render.
+        Returns (description, requirements) tuple.
         """
         if not external_path:
             return "", ""
 
-        # Extract job posting ID from path like /job/City-State/Role-Title_ID
-        # The API uses the posting ID which is the last segment after underscore
         parts = external_path.rstrip("/").split("/")
         if not parts:
             return "", ""
 
-        # Try the detail endpoint
         detail_url = api_url.rstrip("/jobs") + f"/job{external_path}"
 
         try:
@@ -265,7 +266,6 @@ class WorkdayCollector(BaseCollector):
             if resp.status_code == 200:
                 data = resp.json()
 
-                # Extract from jobPostingInfo
                 info = data.get("jobPostingInfo", {})
                 desc_html = (
                     info.get("jobDescription", "")
@@ -278,7 +278,6 @@ class WorkdayCollector(BaseCollector):
                     soup = BeautifulSoup(desc_html, "html.parser")
                     text = self._clean_text(soup.get_text("\n"))
 
-                    # Split into description + requirements
                     lines = text.splitlines()
                     req_start = None
                     for i, line in enumerate(lines):

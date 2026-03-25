@@ -454,6 +454,22 @@ def cache_stats():
         rprint(f"[red]Could not read cache: {e}[/red]")
 
 
+
+# ── dashboard ──────────────────────────────────────────────────────────────────
+
+@app.command()
+def dashboard(
+    port: int = typer.Option(5000, "--port", "-p", help="Port to serve on"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Don't auto-open browser"),
+):
+    """Launch the web dashboard at http://localhost:5000"""
+    try:
+        from job_agent.dashboard import run
+        run(port=port, open_browser=not no_browser)
+    except ImportError:
+        rprint("[red]Flask not installed. Run: pip install flask[/red]")
+        raise typer.Exit(1)
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
