@@ -90,7 +90,7 @@ def collect(
                                  help="Show discards and dupes"),
     no_log: bool = typer.Option(False, "--no-log"),
     limit: int = typer.Option(0, "--limit", "-l",
-                              help="Stop after N stored jobs (apply+review). 0=unlimited"),
+                              help="Stop after N APPLY_NOW matches (0=unlimited)"),
     parallel: bool = typer.Option(True, "--parallel/--no-parallel", "-p",
                                   help="Fetch companies in parallel (default: yes)"),
     workers: int = typer.Option(5, "--workers", "-w",
@@ -100,7 +100,7 @@ def collect(
         help="AI scoring backend: openai | mock  (default: prompt to choose)"),
     scoring_model: Optional[str] = typer.Option(
         None, "--scoring-model",
-        help="Model name for the scoring provider (e.g. gpt-4o)"),
+        help="Model name for the scoring provider (e.g. gpt-4o-mini)"),
     save_config: bool = typer.Option(
         False, "--save-config",
         help="Save --scoring-provider/model to ~/.job_agent/config.yaml"),
@@ -111,27 +111,16 @@ def collect(
     """
     Collect jobs from configured sources and score them.
 
+    \b
     SCORING MODES:
+      job-agent collect --no-ai                          # keyword engine only
+      job-agent collect --scoring-provider mock          # mock AI (offline)
+      job-agent collect --scoring-provider openai \\
+                        --scoring-model gpt-4o-mini      # OpenAI GPT
 
     \b
-      # Keyword engine only (fast, offline):
-      job-agent collect --no-ai
-
-    \b
-      # Mock AI scorer (fast, offline, for testing):
-      job-agent collect --scoring-provider mock
-
-    \b
-      # OpenAI GPT-4o (best results, needs OPENAI_API_KEY):
-      job-agent collect --scoring-provider openai --scoring-model gpt-4o
-
-    \b
-      # Save config so you don't have to repeat flags:
-      job-agent collect --scoring-provider mock --save-config
-
-    \b
-      # Limit stops after N jobs are stored (apply + review):
-      job-agent collect --limit 10
+    LIMIT stops after N APPLY_NOW matches (review jobs don't count):
+      job-agent collect --limit 5
     """
     setup_logging(verbose=verbose, log_to_file=not no_log)
 
@@ -177,7 +166,7 @@ def collect(
         if scorer else "[dim]keyword engine[/dim]"
     )
     mode_label = "[yellow]DRY RUN[/yellow]" if dry_run else "[green]LIVE[/green]"
-    limit_label = f"  |  Limit: [magenta]{limit}[/magenta]" if limit else ""
+    limit_label = f"  |  Limit: [magenta]{limit} apply[/magenta]" if limit else ""
     par_label = f"  |  [cyan]Parallel ({workers}w)[/cyan]" if parallel else ""
 
     console.print(Panel(
@@ -213,27 +202,43 @@ def collect(
     # ── Summary table ─────────────────────────────────────────────────────
     console.print()
     table = Table(title="📊 Collection Summary", border_style="cyan")
-    table.add_column("Source",      style="cyan")
-    table.add_column("Fetched",     justify="right")
-    table.add_column("Scored",      justify="right")
-    table.add_column("✅ Apply",    justify="right", style="green")
-    table.add_column("👀 Review",   justify="right", style="yellow")
-    table.add_column("❌ Discarded",justify="right", style="dim")
-    table.add_column("↩ Dupes",     justify="right", style="dim blue")
-    table.add_column("⚠ Errors",   justify="right", style="red")
+    table.add_column("Source",       style="cyan")
+    table.add_column("Fetched",      justify="right")
+    table.add_column("Scored",       justify="right")
+    table.add_column("✅ Apply",     justify="right", style="green")
+    table.add_column("👀 Review",    justify="right", style="yellow")
+    table.add_column("❌ Discarded", justify="right", style="dim")
+    table.add_column("↩ Dupes",      justify="right", style="dim blue")
+    table.add_column("⚠ Errors",    justify="right", style="red")
+    table.add_column("🪙 Tokens",    justify="right", style="magenta")
     table.add_column("⏱ Time")
 
-    total_apply = total_review = 0
+    total_apply = total_review = total_tokens = 0
     for s in all_stats:
+        tok = f"{s.tokens_used:,}" if s.tokens_used else "—"
         table.add_row(
             s.source, str(s.collected), str(s.scored),
             str(s.apply_now), str(s.review), str(s.discarded),
-            str(s.skipped_duplicate), str(s.errors), s.elapsed,
+            str(s.skipped_duplicate), str(s.errors), tok, s.elapsed,
         )
-        total_apply += s.apply_now
+        total_apply  += s.apply_now
         total_review += s.review
+        total_tokens += s.tokens_used
 
     console.print(table)
+
+    # Token + cost estimate
+    if total_tokens > 0 and scorer:
+        model_name = scoring_model or "gpt-4o-mini"
+        input_tok  = int(total_tokens * 0.85)
+        output_tok = int(total_tokens * 0.15)
+        if "gpt-4o-mini" in model_name:
+            cost = (input_tok / 1_000_000 * 0.15) + (output_tok / 1_000_000 * 0.60)
+        elif "gpt-4o" in model_name:
+            cost = (input_tok / 1_000_000 * 2.50) + (output_tok / 1_000_000 * 10.00)
+        else:
+            cost = (input_tok / 1_000_000 * 0.15) + (output_tok / 1_000_000 * 0.60)
+        console.print(f"[magenta]🪙 AI usage: {total_tokens:,} tokens  (~${cost:.4f} USD)[/magenta]")
 
     if dry_run:
         console.print(f"\n[yellow]⚠  DRY RUN — nothing stored.[/yellow]")
@@ -327,7 +332,7 @@ def shortlist(
 
 @app.command()
 def view(job_id: str = typer.Argument(...)):
-    """View full details of a stored job."""
+    """View full details of a stored job including AI reasoning."""
     db = get_db()
     job = db.get_job(job_id)
     if not job:
@@ -349,6 +354,31 @@ def view(job_id: str = typer.Argument(...)):
         title=f"Job {job_id}", border_style=dc,
     ))
 
+    # Show AI reasoning block if this was AI-scored
+    if job.explanation and ("[OPENAI" in job.explanation or "[MOCK" in job.explanation):
+        console.print()
+        console.rule("[bold cyan]🤖 AI Scoring Details[/bold cyan]")
+        console.print()
+
+        # explanation format: "[OPENAI gpt-4o-mini] good match | high confidence"
+        parts = job.explanation.replace("[", "").replace("]", "").split("|")
+        for part in parts:
+            console.print(f"  [cyan]{part.strip()}[/cyan]")
+
+        if matched:
+            console.print()
+            console.print("[bold green]✅ Why it's a match:[/bold green]")
+            for r in matched[:8]:
+                console.print(f"   • {r}")
+
+        if missing:
+            console.print()
+            console.print("[bold yellow]⚠  Gaps / blockers:[/bold yellow]")
+            for m in missing[:6]:
+                console.print(f"   • {m}")
+        console.print()
+
+    # Highlighted job description
     if job.description or job.requirements:
         from job_agent.scoring.engine import HIGH_SKILL_ALIASES, MEDIUM_SKILL_ALIASES, LOW_SKILL_ALIASES
         import re
@@ -356,7 +386,6 @@ def view(job_id: str = typer.Argument(...)):
         matched_set = set(matched)
         full_text = ((job.description or "") + "\n\n" + (job.requirements or "")).strip()
 
-        # Collect aliases for matched skills
         highlight_terms = []
         for skill, aliases in {**HIGH_SKILL_ALIASES, **MEDIUM_SKILL_ALIASES, **LOW_SKILL_ALIASES}.items():
             if skill in matched_set:

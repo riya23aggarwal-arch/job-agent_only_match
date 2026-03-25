@@ -39,6 +39,7 @@ class PipelineStats:
     discarded: int = 0
     skipped_duplicate: int = 0
     errors: int = 0
+    tokens_used: int = 0        # total AI tokens consumed this run
     started_at: float = field(default_factory=time.time)
 
     @property
@@ -78,7 +79,7 @@ class Pipeline:
             db:          Database instance (created if not provided)
             dry_run:     Score but don't store anything
             printer:     Callable(level, msg) for rich output
-            match_limit: Stop after this many stored jobs (apply+review). 0=unlimited
+            match_limit: Stop after this many APPLY_NOW jobs. 0=unlimited
             workers:     Thread count for parallel mode
             scorer:      Optional AI scorer (from ScorerFactory). Falls back to
                          keyword engine if None or on failure.
@@ -193,6 +194,7 @@ class Pipeline:
         try:
             scored = self._score_job(raw_job)
             stats.scored += 1
+            stats.tokens_used += scored.score_result.skill_breakdown.get("tokens_used", 0)
 
             if scored.decision == Decision.APPLY_NOW:
                 self._store(scored)
@@ -237,10 +239,10 @@ class Pipeline:
             stats.errors += 1
             return False
 
-        # Stop if stored job limit reached (counts apply_now + review)
-        if self.match_limit > 0 and stats.stored >= self.match_limit:
+        # Stop when APPLY_NOW count reaches the limit
+        if self.match_limit > 0 and stats.apply_now >= self.match_limit:
             self.printer("counter",
-                f"  ── Match limit reached: {self.match_limit} — stopping early"
+                f"  ── Match limit reached: {self.match_limit} APPLY_NOW — stopping early"
             )
             return True
 
@@ -283,8 +285,35 @@ class Pipeline:
                         "confidence":     ai_result.confidence,
                         "true_blockers":  ai_result.true_blockers,
                         "learnable_gaps": ai_result.learnable_gaps,
+                        "tokens_used":    ai_result.tokens_used,
                     },
                 )
+                # ── AI Result Banner ──────────────────────────────────────
+                verdict_emoji = {
+                    "strong match": "🟢", "good match": "🟡",
+                    "viable match": "🟡", "stretch": "🟠", "weak match": "🔴",
+                }.get(ai_result.verdict, "⚪")
+                decision_emoji = {
+                    Decision.APPLY_NOW: "✅", Decision.REVIEW: "👀", Decision.DISCARD: "❌"
+                }.get(decision, "?")
+                reasons_str   = " | ".join(ai_result.reasons[:3]) or "—"
+                blockers_str  = " | ".join(ai_result.true_blockers[:2]) or "none"
+                gaps_str      = " | ".join(ai_result.learnable_gaps[:2]) or "none"
+                logger.info(
+                    f"\n"
+                    f"  ┌─ 🤖 AI SCORED ────────────────────────────────────────────\n"
+                    f"  │  {raw_job.company} — {raw_job.role}\n"
+                    f"  │  Score:    {score}/100  {verdict_emoji} {ai_result.verdict.upper()}  ({ai_result.confidence} confidence)\n"
+                    f"  │  Decision: {decision_emoji} {decision.value.upper()}\n"
+                    f"  │  Family:   {ai_result.role_family}\n"
+                    f"  │  Reasons:  {reasons_str}\n"
+                    f"  │  Blockers: {blockers_str}\n"
+                    f"  │  Gaps:     {gaps_str}\n"
+                    f"  │  Tokens:   {ai_result.tokens_used}\n"
+                    f"  │  Model:    {ai_result.provider} / {ai_result.model}\n"
+                    f"  └───────────────────────────────────────────────────────────"
+                )
+                # ────────────────────────────────────────────────────────────
                 return ScoredJob(raw=raw_job, score_result=score_result)
 
             except Exception as e:
