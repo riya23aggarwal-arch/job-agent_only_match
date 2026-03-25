@@ -30,8 +30,7 @@ class JobScoringResult:
     learnable_gaps: List[str]
     provider: str
     model: Optional[str] = None
-    tokens_used: int = 0
-    tokens_used: int = 0        # total tokens (input + output) for this call
+    tokens_used: int = 0    # total tokens (input + output) for this call
 
     def to_dict(self) -> dict:
         return {

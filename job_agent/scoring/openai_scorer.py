@@ -25,20 +25,17 @@ class OpenAIScorer(ScorerBase):
 
     AVAILABLE_MODELS = [
         "gpt-4o",
+        "gpt-4o-mini",
         "gpt-4-turbo",
         "gpt-4",
         "gpt-3.5-turbo",
     ]
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini"):
         """
         Args:
             api_key: OpenAI API key. Falls back to OPENAI_API_KEY env var.
-            model: Model name. Default: gpt-4o (best results).
-
-        Raises:
-            ImportError: If openai package is not installed.
-            ValueError: If API key not found.
+            model:   Model name. Default: gpt-4o-mini (fast + cheap).
         """
         try:
             from openai import OpenAI, APIError, RateLimitError
@@ -74,12 +71,12 @@ class OpenAIScorer(ScorerBase):
         Score a job using OpenAI.
 
         Args:
-            job: Dict with keys: company, role, description, requirements,
-                 location, remote
-            candidate_profile: Formatted profile string from get_standard_rubric()
+            job:               Dict with company, role, description, requirements,
+                               location, remote
+            candidate_profile: Formatted string from get_standard_rubric()
 
         Returns:
-            JobScoringResult
+            JobScoringResult with tokens_used set from the actual API response
         """
         user_prompt = OPENAI_USER_PROMPT_TEMPLATE.format(
             candidate_profile=candidate_profile,
@@ -93,7 +90,11 @@ class OpenAIScorer(ScorerBase):
         )
 
         logger.debug(f"[openai] scoring {job.get('company')} — {job.get('role')}")
-        logger.debug(f"[openai] ── PROMPT ──────────────────────────\n{user_prompt}\n────────────────────────────────────────")
+        logger.debug(
+            f"[openai] ── PROMPT ──────────────────────────\n"
+            f"{user_prompt}\n"
+            f"────────────────────────────────────────"
+        )
 
         try:
             response = self.client.chat.completions.create(
@@ -105,13 +106,26 @@ class OpenAIScorer(ScorerBase):
                 temperature=0.2,
                 max_tokens=800,
             )
+
             response_text = response.choices[0].message.content.strip()
-            logger.debug(f"[openai] ── RESPONSE ─────────────────────────\n{response_text}\n────────────────────────────────────────")
+            logger.debug(
+                f"[openai] ── RESPONSE ─────────────────────────\n"
+                f"{response_text}\n"
+                f"────────────────────────────────────────"
+            )
+
             result = self._parse_response(response_text)
             result.provider = "openai"
             result.model = self.model
+
+            # ── Capture actual token usage from the API response ──────────
+            if response.usage:
+                result.tokens_used = response.usage.total_tokens
+            # ─────────────────────────────────────────────────────────────
+
             logger.debug(
-                f"[openai] {result.score}/100 ({result.verdict}, {result.confidence})"
+                f"[openai] {result.score}/100 ({result.verdict}, "
+                f"{result.confidence}) | {result.tokens_used} tokens"
             )
             return result
 
@@ -127,7 +141,6 @@ class OpenAIScorer(ScorerBase):
 
     def _parse_response(self, text: str) -> JobScoringResult:
         """Parse OpenAI JSON response into JobScoringResult."""
-        # Strip markdown fences if present
         text = re.sub(r"```(?:json)?", "", text).strip()
 
         try:
@@ -140,9 +153,9 @@ class OpenAIScorer(ScorerBase):
 
         required = ["role_family", "score", "confidence", "verdict",
                     "reasons", "true_blockers", "learnable_gaps"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            raise ValueError(f"Response missing fields: {missing}")
+        missing_fields = [f for f in required if f not in data]
+        if missing_fields:
+            raise ValueError(f"Response missing fields: {missing_fields}")
 
         score = int(data["score"])
         if not 0 <= score <= 100:
@@ -150,7 +163,7 @@ class OpenAIScorer(ScorerBase):
 
         confidence = str(data["confidence"]).lower()
         if confidence not in _VALID_CONFIDENCE:
-            confidence = "medium"  # graceful degradation
+            confidence = "medium"
 
         verdict = str(data["verdict"]).lower()
         if verdict not in _VALID_VERDICTS:
@@ -171,4 +184,5 @@ class OpenAIScorer(ScorerBase):
             learnable_gaps=to_list(data.get("learnable_gaps")),
             provider="openai",
             model=self.model,
+            # tokens_used set by caller after response.usage is read
         )

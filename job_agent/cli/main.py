@@ -52,7 +52,6 @@ def setup_logging(verbose: bool = False, log_to_file: bool = True):
 
 
 def make_printer(show_discards: bool):
-    """Rich-formatted printer injected into the pipeline."""
     def printer(level: str, msg: str):
         if level == "header":
             console.rule(f"[bold cyan]{msg}[/bold cyan]")
@@ -97,29 +96,32 @@ def collect(
                                 help="Parallel worker count (default 5)"),
     scoring_provider: Optional[str] = typer.Option(
         None, "--scoring-provider",
-        help="AI scoring backend: openai | mock  (default: prompt to choose)"),
+        help="AI scoring backend: openai | mock"),
     scoring_model: Optional[str] = typer.Option(
         None, "--scoring-model",
-        help="Model name for the scoring provider (e.g. gpt-4o-mini)"),
+        help="Model name (e.g. gpt-4o-mini)"),
     save_config: bool = typer.Option(
         False, "--save-config",
         help="Save --scoring-provider/model to ~/.job_agent/config.yaml"),
     no_ai: bool = typer.Option(
         False, "--no-ai",
-        help="Skip AI scoring entirely — use keyword engine only"),
+        help="Skip AI scoring — use keyword engine only"),
 ):
     """
     Collect jobs from configured sources and score them.
 
     \b
-    SCORING MODES:
-      job-agent collect --no-ai                          # keyword engine only
-      job-agent collect --scoring-provider mock          # mock AI (offline)
-      job-agent collect --scoring-provider openai \\
-                        --scoring-model gpt-4o-mini      # OpenAI GPT
+    SCORING:
+      job-agent collect --no-ai
+      job-agent collect --scoring-provider mock
+      job-agent collect --scoring-provider openai --scoring-model gpt-4o-mini
 
     \b
-    LIMIT stops after N APPLY_NOW matches (review jobs don't count):
+    AI results are cached permanently — each job is only sent to the AI once.
+    Subsequent runs use the cache instantly at zero cost.
+
+    \b
+    LIMIT counts only APPLY_NOW matches (review jobs don't count):
       job-agent collect --limit 5
     """
     setup_logging(verbose=verbose, log_to_file=not no_log)
@@ -141,16 +143,16 @@ def collect(
             )
             if save_config and scoring_provider:
                 ScorerFactory.save_config(scoring_provider, scoring_model)
-                console.print("[dim]💾 Scorer config saved to ~/.job_agent/config.yaml[/dim]")
+                console.print("[dim]💾 Scorer config saved[/dim]")
         except KeyboardInterrupt:
             console.print("\n[yellow]Scorer setup cancelled — using keyword engine.[/yellow]")
             scorer = None
         except Exception as e:
             console.print(f"[red]❌ Scorer error: {e}[/red]")
-            console.print("[yellow]Falling back to keyword scoring engine.[/yellow]")
+            console.print("[yellow]Falling back to keyword engine.[/yellow]")
             scorer = None
 
-    # ── Pipeline setup ────────────────────────────────────────────────────
+    # ── Pipeline ──────────────────────────────────────────────────────────
     db = get_db()
     pipeline = Pipeline(
         db=db,
@@ -165,9 +167,9 @@ def collect(
         f"[magenta]{scorer.get_name()}[/magenta]"
         if scorer else "[dim]keyword engine[/dim]"
     )
-    mode_label = "[yellow]DRY RUN[/yellow]" if dry_run else "[green]LIVE[/green]"
+    mode_label  = "[yellow]DRY RUN[/yellow]" if dry_run else "[green]LIVE[/green]"
     limit_label = f"  |  Limit: [magenta]{limit} apply[/magenta]" if limit else ""
-    par_label = f"  |  [cyan]Parallel ({workers}w)[/cyan]" if parallel else ""
+    par_label   = f"  |  [cyan]Parallel ({workers}w)[/cyan]" if parallel else ""
 
     console.print(Panel(
         f"[bold]job-agent collect[/bold]  {mode_label}\n"
@@ -210,35 +212,46 @@ def collect(
     table.add_column("❌ Discarded", justify="right", style="dim")
     table.add_column("↩ Dupes",      justify="right", style="dim blue")
     table.add_column("⚠ Errors",    justify="right", style="red")
+    table.add_column("♻ Cached",    justify="right", style="cyan")
     table.add_column("🪙 Tokens",    justify="right", style="magenta")
     table.add_column("⏱ Time")
 
-    total_apply = total_review = total_tokens = 0
+    total_apply = total_review = total_tokens = total_cached = 0
     for s in all_stats:
-        tok = f"{s.tokens_used:,}" if s.tokens_used else "—"
+        tok    = f"{s.tokens_used:,}" if s.tokens_used else "—"
+        cached = f"{s.cache_hits}"    if s.cache_hits  else "—"
         table.add_row(
             s.source, str(s.collected), str(s.scored),
             str(s.apply_now), str(s.review), str(s.discarded),
-            str(s.skipped_duplicate), str(s.errors), tok, s.elapsed,
+            str(s.skipped_duplicate), str(s.errors),
+            cached, tok, s.elapsed,
         )
         total_apply  += s.apply_now
         total_review += s.review
         total_tokens += s.tokens_used
+        total_cached += s.cache_hits
 
     console.print(table)
 
-    # Token + cost estimate
-    if total_tokens > 0 and scorer:
+    # Token + cost + cache summary
+    if scorer:
         model_name = scoring_model or "gpt-4o-mini"
-        input_tok  = int(total_tokens * 0.85)
-        output_tok = int(total_tokens * 0.15)
-        if "gpt-4o-mini" in model_name:
-            cost = (input_tok / 1_000_000 * 0.15) + (output_tok / 1_000_000 * 0.60)
-        elif "gpt-4o" in model_name:
-            cost = (input_tok / 1_000_000 * 2.50) + (output_tok / 1_000_000 * 10.00)
-        else:
-            cost = (input_tok / 1_000_000 * 0.15) + (output_tok / 1_000_000 * 0.60)
-        console.print(f"[magenta]🪙 AI usage: {total_tokens:,} tokens  (~${cost:.4f} USD)[/magenta]")
+        if total_cached > 0:
+            console.print(f"[cyan]♻  Cache hits: {total_cached} jobs (free)[/cyan]")
+        if total_tokens > 0:
+            input_tok  = int(total_tokens * 0.85)
+            output_tok = int(total_tokens * 0.15)
+            if "gpt-4o-mini" in model_name:
+                cost = (input_tok / 1_000_000 * 0.15) + (output_tok / 1_000_000 * 0.60)
+            elif "gpt-4o" in model_name:
+                cost = (input_tok / 1_000_000 * 2.50) + (output_tok / 1_000_000 * 10.00)
+            else:
+                cost = (input_tok / 1_000_000 * 0.15) + (output_tok / 1_000_000 * 0.60)
+            console.print(
+                f"[magenta]🪙 New API usage: {total_tokens:,} tokens  (~${cost:.4f} USD)[/magenta]"
+            )
+        elif total_cached > 0:
+            console.print("[dim]No new API calls — all results from cache.[/dim]")
 
     if dry_run:
         console.print(f"\n[yellow]⚠  DRY RUN — nothing stored.[/yellow]")
@@ -340,7 +353,7 @@ def view(job_id: str = typer.Argument(...)):
 
     matched = json.loads(job.matched_skills)
     missing = json.loads(job.missing_skills)
-    dc = "green" if job.decision == "apply_now" else "yellow"
+    dc  = "green" if job.decision == "apply_now" else "yellow"
     bar = "█" * (job.score // 5) + "░" * (20 - job.score // 5)
 
     console.print(Panel(
@@ -354,14 +367,15 @@ def view(job_id: str = typer.Argument(...)):
         title=f"Job {job_id}", border_style=dc,
     ))
 
-    # Show AI reasoning block if this was AI-scored
+    # AI reasoning block
     if job.explanation and ("[OPENAI" in job.explanation or "[MOCK" in job.explanation):
+        cached_marker = " [CACHED]" if "[CACHED]" in job.explanation else ""
         console.print()
-        console.rule("[bold cyan]🤖 AI Scoring Details[/bold cyan]")
+        console.rule(f"[bold cyan]🤖 AI Scoring Details{cached_marker}[/bold cyan]")
         console.print()
 
-        # explanation format: "[OPENAI gpt-4o-mini] good match | high confidence"
-        parts = job.explanation.replace("[", "").replace("]", "").split("|")
+        clean = job.explanation.replace("[CACHED]", "").strip()
+        parts = clean.replace("[", "").replace("]", "").split("|")
         for part in parts:
             console.print(f"  [cyan]{part.strip()}[/cyan]")
 
@@ -407,6 +421,37 @@ def view(job_id: str = typer.Argument(...)):
         console.print()
         console.print(highlighted)
         console.print()
+
+
+# ── cache-stats ────────────────────────────────────────────────────────────────
+
+@app.command(name="cache-stats")
+def cache_stats():
+    """Show AI scoring cache statistics."""
+    try:
+        from job_agent.scoring.ai_cache import AICache
+        cache = AICache()
+        stats = cache.stats()
+
+        console.print(Panel(
+            f"[bold]Total cached:[/bold] {stats['total_cached']} jobs\n"
+            f"[bold]Tokens saved:[/bold] {stats.get('total_tokens_saved', 0):,} "
+            f"(~${stats.get('total_tokens_saved', 0) / 1_000_000 * 0.15:.4f} USD)\n"
+            f"[bold]Cache file:[/bold]   {stats['db_path']}",
+            title="♻  AI Score Cache", border_style="cyan",
+        ))
+
+        if stats.get("by_provider"):
+            table = Table(border_style="dim")
+            table.add_column("Provider")
+            table.add_column("Model")
+            table.add_column("Cached jobs", justify="right")
+            for row in stats["by_provider"]:
+                table.add_row(row["provider"], row["model"] or "—", str(row["cnt"]))
+            console.print(table)
+
+    except Exception as e:
+        rprint(f"[red]Could not read cache: {e}[/red]")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

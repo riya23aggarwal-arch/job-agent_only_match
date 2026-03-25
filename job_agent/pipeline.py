@@ -3,13 +3,16 @@ Pipeline Orchestrator
 
 Streaming pipeline: collect → score → store (APPLY_NOW + REVIEW only)
 
-Two modes:
+Two fetch modes:
   run(collector)                       — sequential, single source
-  run_parallel(collector_class, list)  — parallel fetch, 5-10x faster
+  run_parallel(collector_class, list)  — parallel fetch + parallel AI scoring
 
 AI Scoring:
-  Pass a scorer= argument (from ScorerFactory) to use an AI backend.
-  Falls back to the keyword engine automatically on any AI failure.
+  - Pass scorer= (from ScorerFactory) to use an AI backend
+  - Results are cached permanently in ~/.job_agent/ai_cache.db
+  - Cache hits are free (0 tokens, instant)
+  - Scoring is parallelised — multiple API calls fire simultaneously
+  - Falls back to the keyword engine automatically on any AI failure
 """
 
 import logging
@@ -17,7 +20,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Type
+from typing import Any, List, Optional, Tuple, Type
 
 from job_agent.collectors.base import BaseCollector
 from job_agent.models import Decision, DiscardLog, RawJob, ScoreResult, ScoredJob
@@ -25,6 +28,10 @@ from job_agent.scoring.engine import ScoringEngine
 from job_agent.storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+# Number of parallel scoring threads. Keep ≤ 10 to stay well under
+# OpenAI's rate limits (gpt-4o-mini: 500 RPM on tier-1).
+_SCORE_WORKERS = 8
 
 
 # ── Pipeline Stats ─────────────────────────────────────────────────────────────
@@ -39,7 +46,8 @@ class PipelineStats:
     discarded: int = 0
     skipped_duplicate: int = 0
     errors: int = 0
-    tokens_used: int = 0        # total AI tokens consumed this run
+    tokens_used: int = 0        # live API tokens this run
+    cache_hits: int = 0         # jobs answered from cache (no API call)
     started_at: float = field(default_factory=time.time)
 
     @property
@@ -53,11 +61,12 @@ class PipelineStats:
         return f"{m}m {s:02d}s" if m else f"{s}s"
 
     def summary(self) -> str:
+        cache_str = f" Cache={self.cache_hits}" if self.cache_hits else ""
         return (
             f"[{self.source}] Collected={self.collected} | "
             f"Apply={self.apply_now} Review={self.review} "
             f"Discarded={self.discarded} Dupes={self.skipped_duplicate} "
-            f"Errors={self.errors} | {self.elapsed}"
+            f"Errors={self.errors}{cache_str} | {self.elapsed}"
         )
 
 
@@ -72,27 +81,41 @@ class Pipeline:
         printer=None,
         match_limit: int = 0,
         workers: int = 5,
-        scorer: Optional[Any] = None,  # ScorerBase instance (AI backend)
+        scorer: Optional[Any] = None,
     ):
         """
         Args:
             db:          Database instance (created if not provided)
             dry_run:     Score but don't store anything
             printer:     Callable(level, msg) for rich output
-            match_limit: Stop after this many APPLY_NOW jobs. 0=unlimited
-            workers:     Thread count for parallel mode
+            match_limit: Stop after this many APPLY_NOW jobs. 0 = unlimited
+            workers:     Thread count for parallel company fetching
             scorer:      Optional AI scorer (from ScorerFactory). Falls back to
-                         keyword engine if None or on failure.
+                         keyword engine if None or on any failure.
         """
-        self.db = db or Database()
-        self.engine = ScoringEngine()          # keyword engine — always available
-        self.scorer = scorer                   # optional AI scorer
-        self.dry_run = dry_run
+        self.db          = db or Database()
+        self.engine      = ScoringEngine()   # keyword engine, always available
+        self.scorer      = scorer
+        self.dry_run     = dry_run
         self.match_limit = match_limit
-        self.workers = workers
-        self.printer = printer or (lambda level, msg: logger.info(msg))
+        self.workers     = workers
+        self.printer     = printer or (lambda level, msg: logger.info(msg))
 
-        # Cache the rubric string once — avoid re-building it per job
+        # Cache — loaded once, shared across all scoring threads
+        self._cache = None
+        if self.scorer is not None:
+            try:
+                from job_agent.scoring.ai_cache import AICache
+                self._cache = AICache()
+                cs = self._cache.stats()
+                logger.info(
+                    f"[cache] {cs['total_cached']} jobs cached "
+                    f"(~{cs['total_tokens_saved']:,} tokens saved)"
+                )
+            except Exception as e:
+                logger.warning(f"Could not load AI cache: {e}")
+
+        # Build rubric once — shared across all scoring threads (read-only)
         self._rubric: Optional[str] = None
         if self.scorer is not None:
             try:
@@ -100,7 +123,7 @@ class Pipeline:
                 self._rubric = get_standard_rubric()
             except Exception as e:
                 logger.warning(f"Could not build scoring rubric: {e}")
-                self.scorer = None  # disable AI scorer if rubric fails
+                self.scorer = None
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -125,12 +148,13 @@ class Pipeline:
         **collector_kwargs,
     ) -> PipelineStats:
         """
-        Parallel fetch of all companies, sequential scoring.
+        Phase 1 — Parallel fetch:  all companies fetched simultaneously
+        Phase 2 — Parallel score:  all AI calls fired simultaneously
+        Phase 3 — Sequential store: DB writes + match_limit (thread-safe)
 
-        WHY: Network I/O (fetching) is the bottleneck — parallelize that.
-             Scoring is CPU-bound + hits the DB — keep it sequential.
-
-        SPEEDUP: 17 companies × 2s each = 34s sequential → ~4s with 10 workers
+        Speedup example:
+          100 jobs × 1.5s each sequential = 150s
+          100 jobs with 8 parallel scorers = ~20s
         """
         source_name = f"{collector_class.source_name}-parallel"
         stats = PipelineStats(source=source_name)
@@ -140,6 +164,7 @@ class Pipeline:
             f"({len(companies)} companies, {self.workers} workers)"
         )
 
+        # ── Phase 1: Fetch ───────────────────────────────────────────────
         all_jobs: List[RawJob] = []
         lock = threading.Lock()
 
@@ -150,7 +175,7 @@ class Pipeline:
                 with lock:
                     all_jobs.extend(jobs)
             except Exception as e:
-                logger.warning(f"[parallel] {company}: {e}")
+                logger.warning(f"[parallel] fetch {company}: {e}")
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = [pool.submit(fetch_one, c) for c in companies]
@@ -162,12 +187,34 @@ class Pipeline:
                     stats.errors += 1
 
         self.printer("counter",
-            f"  ── Parallel fetch done: {len(all_jobs)} jobs in {stats.elapsed}"
+            f"  ── Fetch done: {len(all_jobs)} jobs in {stats.elapsed}"
         )
 
-        for raw_job in all_jobs:
-            if self._process_job(raw_job, stats):
+        # ── Phase 2: Score in parallel ───────────────────────────────────
+        # Filter dupes first (fast, no API) — no point scoring already-seen jobs
+        to_score: List[RawJob] = []
+        for job in all_jobs:
+            stats.collected += 1
+            if self.db.job_exists(job.apply_url):
+                stats.skipped_duplicate += 1
+                self.printer("dupe", f"  ↩  DUPE     {job.company} — {job.role}")
+            else:
+                to_score.append(job)
+
+        if to_score:
+            scored_pairs = self._score_jobs_parallel(to_score, stats)
+        else:
+            scored_pairs = []
+
+        # ── Phase 3: Store sequentially ──────────────────────────────────
+        stop = False
+        for raw_job, scored in scored_pairs:
+            if stop:
                 break
+            if scored is None:
+                stats.errors += 1
+                continue
+            stop = self._route_job(raw_job, scored, stats)
 
         self._finalize(stats)
         return stats
@@ -176,14 +223,73 @@ class Pipeline:
         """Score one job without storing — for testing/diagnosis."""
         return ScoredJob(raw=raw_job, score_result=self.engine.score(raw_job))
 
-    # ── Internal ───────────────────────────────────────────────────────────────
+    # ── Parallel scoring ───────────────────────────────────────────────────────
+
+    def _score_jobs_parallel(
+        self,
+        jobs: List[RawJob],
+        stats: PipelineStats,
+    ) -> List[Tuple[RawJob, Optional[ScoredJob]]]:
+        """
+        Score all jobs using a thread pool.
+
+        Returns list of (raw_job, scored_job) in original order.
+        scored_job is None if scoring failed for that job.
+
+        Cache hits are resolved before the thread pool — they don't consume
+        a thread slot since there's no I/O to do.
+        """
+        results: List[Tuple[RawJob, Optional[ScoredJob]]] = [None] * len(jobs)
+
+        # Separate cache hits from jobs that need an API call
+        need_api: List[Tuple[int, RawJob]] = []   # (original_index, job)
+
+        for i, raw_job in enumerate(jobs):
+            cached = self._try_cache_get(raw_job)
+            if cached is not None:
+                stats.cache_hits += 1
+                results[i] = (raw_job, cached)
+            else:
+                need_api.append((i, raw_job))
+
+        if self._cache and need_api:
+            cache_hits = stats.cache_hits
+            logger.info(
+                f"[cache] {cache_hits} hits / {len(need_api)} need API call"
+            )
+
+        if not need_api:
+            return results
+
+        # Fire API calls in parallel
+        def score_one(idx_job: Tuple[int, RawJob]):
+            idx, raw_job = idx_job
+            try:
+                scored = self._score_job_api(raw_job)
+                return idx, raw_job, scored
+            except Exception as e:
+                logger.error(
+                    f"[parallel] score error "
+                    f"{raw_job.company}/{raw_job.role}: {e}"
+                )
+                self.printer(
+                    "error",
+                    f"  ⚠  SCORE ERROR  {raw_job.company} — {raw_job.role}: {e}"
+                )
+                return idx, raw_job, None
+
+        with ThreadPoolExecutor(max_workers=_SCORE_WORKERS) as pool:
+            futures = {pool.submit(score_one, item): item for item in need_api}
+            for fut in as_completed(futures):
+                idx, raw_job, scored = fut.result()
+                results[idx] = (raw_job, scored)
+
+        return results
+
+    # ── Sequential pipeline (used by run()) ───────────────────────────────────
 
     def _process_job(self, raw_job: RawJob, stats: PipelineStats) -> bool:
-        """
-        Score and route one job.
-
-        Returns True if match_limit has been reached (caller should stop).
-        """
+        """Score + route one job. Returns True if match_limit reached."""
         stats.collected += 1
 
         if self.db.job_exists(raw_job.apply_url):
@@ -192,46 +298,15 @@ class Pipeline:
             return False
 
         try:
-            scored = self._score_job(raw_job)
-            stats.scored += 1
-            stats.tokens_used += scored.score_result.skill_breakdown.get("tokens_used", 0)
-
-            if scored.decision == Decision.APPLY_NOW:
-                self._store(scored)
-                stats.apply_now += 1
-                self.printer("apply",
-                    f"  ✅ APPLY NOW  [{scored.score_result.score:3d}]  "
-                    f"{raw_job.company} — {raw_job.role}  |  {raw_job.location}"
-                )
-                self.printer("skills",
-                    f"     Skills: {', '.join(scored.score_result.matched_skills[:6])}"
-                )
-
-            elif scored.decision == Decision.REVIEW:
-                self._store(scored)
-                stats.review += 1
-                self.printer("review",
-                    f"  👀 REVIEW     [{scored.score_result.score:3d}]  "
-                    f"{raw_job.company} — {raw_job.role}  |  {raw_job.location}"
-                )
-                self.printer("skills",
-                    f"     Skills: {', '.join(scored.score_result.matched_skills[:6])}"
-                )
-
+            # Try cache first
+            cached = self._try_cache_get(raw_job)
+            if cached is not None:
+                stats.cache_hits += 1
+                scored = cached
             else:
-                self._discard(raw_job, scored)
-                stats.discarded += 1
-                self.printer("discard",
-                    f"  ❌ DISCARD    [{scored.score_result.score:3d}]  "
-                    f"{raw_job.company} — {raw_job.role}  |  {raw_job.location}"
-                )
+                scored = self._score_job_api(raw_job)
 
-            if stats.scored % 25 == 0:
-                self.printer("counter",
-                    f"  ── {stats.scored} scored  "
-                    f"✅ {stats.apply_now}  👀 {stats.review}  "
-                    f"❌ {stats.discarded}  ⏱ {stats.elapsed}"
-                )
+            return self._route_job(raw_job, scored, stats)
 
         except Exception as e:
             logger.error(f"Pipeline error {raw_job.company}/{raw_job.role}: {e}")
@@ -239,29 +314,72 @@ class Pipeline:
             stats.errors += 1
             return False
 
-        # Stop when APPLY_NOW count reaches the limit
-        if self.match_limit > 0 and stats.apply_now >= self.match_limit:
-            self.printer("counter",
-                f"  ── Match limit reached: {self.match_limit} APPLY_NOW — stopping early"
-            )
-            return True
+    # ── Core scoring logic ─────────────────────────────────────────────────────
 
-        return False
-
-    def _score_job(self, raw_job: RawJob) -> ScoredJob:
+    def _try_cache_get(self, raw_job: RawJob) -> Optional[ScoredJob]:
         """
-        Score a job using AI scorer if available, else keyword engine.
+        Return a ScoredJob from cache if available, else None.
+        Does NOT touch the API or the keyword engine.
+        """
+        if self._cache is None or self.scorer is None:
+            return None
+        cached_ai = self._cache.get(raw_job.apply_url)
+        if cached_ai is None:
+            return None
 
-        The AI scorer requires a dict; RawJob.to_dict() handles the conversion.
-        Falls back to keyword engine on any AI failure.
+        score = cached_ai.score
+        if score >= 70:
+            decision = Decision.APPLY_NOW
+        elif score >= 50:
+            decision = Decision.REVIEW
+        else:
+            decision = Decision.DISCARD
+
+        score_result = ScoreResult(
+            score=score,
+            decision=decision,
+            matched_skills=cached_ai.reasons[:6],
+            missing_skills=(cached_ai.true_blockers + cached_ai.learnable_gaps)[:6],
+            explanation=(
+                f"[{cached_ai.provider.upper()} {cached_ai.model}] "
+                f"{cached_ai.verdict} | {cached_ai.confidence} confidence"
+                f" [CACHED]"
+            ),
+            skill_breakdown={
+                "role_family":    cached_ai.role_family,
+                "verdict":        cached_ai.verdict,
+                "confidence":     cached_ai.confidence,
+                "true_blockers":  cached_ai.true_blockers,
+                "learnable_gaps": cached_ai.learnable_gaps,
+                "tokens_used":    0,  # cache hit
+            },
+        )
+        logger.info(
+            f"[cache] ♻  {raw_job.company} — {raw_job.role} "
+            f"({score}/100, {cached_ai.verdict})"
+        )
+        return ScoredJob(raw=raw_job, score_result=score_result)
+
+    def _score_job_api(self, raw_job: RawJob) -> ScoredJob:
+        """
+        Score using AI scorer (if configured) or keyword engine.
+        Writes result to cache on success.
+        Thread-safe: only reads self.scorer and self._rubric (immutable after init).
         """
         if self.scorer is not None and self._rubric is not None:
             try:
-                # Convert RawJob → dict (scorer.score() expects dict, not RawJob)
                 job_dict = raw_job.to_dict()
                 ai_result = self.scorer.score(job_dict, self._rubric)
 
-                # Map AI verdict → Decision
+                # Write to permanent cache immediately
+                if self._cache is not None:
+                    self._cache.put(
+                        raw_job.apply_url,
+                        raw_job.company,
+                        raw_job.role,
+                        ai_result,
+                    )
+
                 score = ai_result.score
                 if score >= 70:
                     decision = Decision.APPLY_NOW
@@ -288,20 +406,23 @@ class Pipeline:
                         "tokens_used":    ai_result.tokens_used,
                     },
                 )
+
                 # ── AI Result Banner ──────────────────────────────────────
                 verdict_emoji = {
                     "strong match": "🟢", "good match": "🟡",
                     "viable match": "🟡", "stretch": "🟠", "weak match": "🔴",
                 }.get(ai_result.verdict, "⚪")
                 decision_emoji = {
-                    Decision.APPLY_NOW: "✅", Decision.REVIEW: "👀", Decision.DISCARD: "❌"
+                    Decision.APPLY_NOW: "✅",
+                    Decision.REVIEW:    "👀",
+                    Decision.DISCARD:   "❌",
                 }.get(decision, "?")
-                reasons_str   = " | ".join(ai_result.reasons[:3]) or "—"
-                blockers_str  = " | ".join(ai_result.true_blockers[:2]) or "none"
-                gaps_str      = " | ".join(ai_result.learnable_gaps[:2]) or "none"
+                reasons_str  = " | ".join(ai_result.reasons[:3]) or "—"
+                blockers_str = " | ".join(ai_result.true_blockers[:2]) or "none"
+                gaps_str     = " | ".join(ai_result.learnable_gaps[:2]) or "none"
                 logger.info(
                     f"\n"
-                    f"  ┌─ 🤖 AI SCORED ────────────────────────────────────────────\n"
+                    f"  ┌─ 🤖 AI SCORED ───────────────────────────────────────────\n"
                     f"  │  {raw_job.company} — {raw_job.role}\n"
                     f"  │  Score:    {score}/100  {verdict_emoji} {ai_result.verdict.upper()}  ({ai_result.confidence} confidence)\n"
                     f"  │  Decision: {decision_emoji} {decision.value.upper()}\n"
@@ -309,19 +430,79 @@ class Pipeline:
                     f"  │  Reasons:  {reasons_str}\n"
                     f"  │  Blockers: {blockers_str}\n"
                     f"  │  Gaps:     {gaps_str}\n"
-                    f"  │  Tokens:   {ai_result.tokens_used}\n"
+                    f"  │  Tokens:   {ai_result.tokens_used}  (cached for future runs)\n"
                     f"  │  Model:    {ai_result.provider} / {ai_result.model}\n"
-                    f"  └───────────────────────────────────────────────────────────"
+                    f"  └──────────────────────────────────────────────────────────"
                 )
-                # ────────────────────────────────────────────────────────────
+                # ─────────────────────────────────────────────────────────
                 return ScoredJob(raw=raw_job, score_result=score_result)
 
             except Exception as e:
                 logger.warning(f"AI scorer failed, using keyword engine: {e}")
-                # Fall through to keyword engine
 
         # Keyword engine fallback
         return ScoredJob(raw=raw_job, score_result=self.engine.score(raw_job))
+
+    # ── Routing + storage ──────────────────────────────────────────────────────
+
+    def _route_job(
+        self,
+        raw_job: RawJob,
+        scored: ScoredJob,
+        stats: PipelineStats,
+    ) -> bool:
+        """
+        Store/discard a scored job and update stats.
+        Returns True if match_limit has been reached.
+        """
+        stats.scored += 1
+        stats.tokens_used += scored.score_result.skill_breakdown.get("tokens_used", 0)
+
+        if scored.decision == Decision.APPLY_NOW:
+            self._store(scored)
+            stats.apply_now += 1
+            self.printer("apply",
+                f"  ✅ APPLY NOW  [{scored.score_result.score:3d}]  "
+                f"{raw_job.company} — {raw_job.role}  |  {raw_job.location}"
+            )
+            self.printer("skills",
+                f"     Skills: {', '.join(scored.score_result.matched_skills[:6])}"
+            )
+
+        elif scored.decision == Decision.REVIEW:
+            self._store(scored)
+            stats.review += 1
+            self.printer("review",
+                f"  👀 REVIEW     [{scored.score_result.score:3d}]  "
+                f"{raw_job.company} — {raw_job.role}  |  {raw_job.location}"
+            )
+            self.printer("skills",
+                f"     Skills: {', '.join(scored.score_result.matched_skills[:6])}"
+            )
+
+        else:
+            self._discard(raw_job, scored)
+            stats.discarded += 1
+            self.printer("discard",
+                f"  ❌ DISCARD    [{scored.score_result.score:3d}]  "
+                f"{raw_job.company} — {raw_job.role}  |  {raw_job.location}"
+            )
+
+        if stats.scored % 25 == 0:
+            self.printer("counter",
+                f"  ── {stats.scored} scored  "
+                f"✅ {stats.apply_now}  👀 {stats.review}  "
+                f"❌ {stats.discarded}  ⏱ {stats.elapsed}"
+            )
+
+        # Stop when APPLY_NOW limit reached
+        if self.match_limit > 0 and stats.apply_now >= self.match_limit:
+            self.printer("counter",
+                f"  ── Match limit reached: {self.match_limit} APPLY_NOW — stopping early"
+            )
+            return True
+
+        return False
 
     def _store(self, scored: ScoredJob):
         if not self.dry_run:
