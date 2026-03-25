@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "job-agent"
+version = "1.0.0"
+description = "Riya's personal job application system"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "typer[all]>=0.12",
+    "rich>=13.7",
+    "playwright>=1.44",
+    "pandas>=2.2",
+    "jinja2>=3.1",
+    "lxml>=5.0",
+]
+
+[project.scripts]
+job-agent = "job_agent.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["job_agent*"]
